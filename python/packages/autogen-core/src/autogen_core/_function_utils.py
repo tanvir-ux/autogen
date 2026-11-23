@@ -41,15 +41,20 @@ def get_typed_signature(call: Callable[..., Any]) -> inspect.Signature:
         The signature of the function with type annotations
     """
     signature = inspect.signature(call)
-    globalns = getattr(call, "__globals__", {})
+    # typing.get_type_hints rejects functools.partial, so read hints from the
+    # wrapped callable and its globals.
     func_call = call.func if isinstance(call, partial) else call
+    globalns = getattr(func_call, "__globals__", {})
     type_hints = typing.get_type_hints(func_call, globalns, include_extras=True)
     typed_params = [
         inspect.Parameter(
             name=param.name,
             kind=param.kind,
             default=param.default,
-            annotation=type_hints[param.name],
+            # typing.get_type_hints omits parameters that have no annotation.
+            # Keep the original annotation (inspect.Parameter.empty) so
+            # get_missing_annotations can still report them.
+            annotation=type_hints.get(param.name, param.annotation),
         )
         for param in signature.parameters.values()
     ]
@@ -73,8 +78,11 @@ def get_typed_return_annotation(call: Callable[..., Any]) -> Any:
     if annotation is inspect.Signature.empty:
         return None
 
-    globalns = getattr(call, "__globals__", {})
-    type_hints = typing.get_type_hints(call, globalns, include_extras=True)
+    # typing.get_type_hints rejects functools.partial. Resolve hints on the
+    # wrapped function, matching get_typed_signature.
+    func_call = call.func if isinstance(call, partial) else call
+    globalns = getattr(func_call, "__globals__", {})
+    type_hints = typing.get_type_hints(func_call, globalns, include_extras=True)
     return type_hints.get("return", inspect.Signature.empty)
 
 
