@@ -1,6 +1,38 @@
+import asyncio
 import threading
 from asyncio import Future
 from typing import Any, Callable, List
+
+
+def _cancel_linked_future(future: Future[Any]) -> None:
+    """Cancel *future* on the event loop that owns it.
+
+    ``Future.cancel()`` schedules completion callbacks with that loop. Calling it
+    from another thread raises ``RuntimeError`` when the loop is in debug mode and
+    leaves those callbacks unscheduled.
+    """
+    if future.done():
+        return
+
+    loop = future.get_loop()
+    try:
+        on_owning_loop = asyncio.get_running_loop() is loop
+    except RuntimeError:
+        on_owning_loop = False
+
+    if on_owning_loop:
+        future.cancel()
+        return
+
+    try:
+        loop.call_soon_threadsafe(future.cancel)
+    except RuntimeError:
+        # The owning loop is closed, so callbacks can no longer be scheduled.
+        if not future.done():
+            try:
+                future.cancel()
+            except RuntimeError:
+                return
 
 
 class CancellationToken:
@@ -33,14 +65,18 @@ class CancellationToken:
                 self._callbacks.append(callback)
 
     def link_future(self, future: Future[Any]) -> Future[Any]:
-        """Link a pending async call to a token to allow its cancellation"""
+        """Link a pending async call to a token to allow its cancellation.
+
+        The future is cancelled on its owning event loop, including when this
+        token is cancelled from another thread.
+        """
+
+        def _cancel() -> None:
+            _cancel_linked_future(future)
+
         with self._lock:
             if self._cancelled:
-                future.cancel()
+                _cancel()
             else:
-
-                def _cancel() -> None:
-                    future.cancel()
-
                 self._callbacks.append(_cancel)
         return future

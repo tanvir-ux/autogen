@@ -1,5 +1,7 @@
 import asyncio
+import threading
 from dataclasses import dataclass
+from typing import Callable
 
 import pytest
 from autogen_core import (
@@ -158,3 +160,111 @@ async def test_nested_cancellation_inner_called() -> None:
     long_running_agent = await runtime.try_get_underlying_agent_instance(long_running_id, type=LongRunningAgent)
     assert long_running_agent.called
     assert long_running_agent.cancelled
+
+
+async def _cancel_on_thread(action: Callable[[], object]) -> list[Exception]:
+    """Run a token operation on another thread and collect exceptions it raises."""
+    errors: list[Exception] = []
+
+    def _run() -> None:
+        try:
+            action()
+        except Exception as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=_run)
+    worker.start()
+    await asyncio.to_thread(worker.join, 2)
+    assert worker.is_alive() is False
+    return errors
+
+
+@pytest.mark.asyncio
+async def test_link_future_cancel_on_owning_loop_is_immediate() -> None:
+    """Cancellation on the future's loop still marks the future cancelled immediately."""
+    loop = asyncio.get_running_loop()
+    token = CancellationToken()
+    future: asyncio.Future[None] = loop.create_future()
+    assert token.link_future(future) is future
+    token.cancel()
+    assert future.cancelled()
+
+    already_cancelled = CancellationToken()
+    already_cancelled.cancel()
+    linked_late: asyncio.Future[None] = loop.create_future()
+    already_cancelled.link_future(linked_late)
+    assert linked_late.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_cancel_linked_future_from_other_thread() -> None:
+    """Cancelling from another thread must cancel the linked future on its own loop."""
+    loop = asyncio.get_running_loop()
+    previous_debug = loop.get_debug()
+    loop.set_debug(True)
+    try:
+        token = CancellationToken()
+        future: asyncio.Future[None] = loop.create_future()
+        callback_called = asyncio.Event()
+
+        def _on_done(_future: asyncio.Future[None]) -> None:
+            callback_called.set()
+
+        future.add_done_callback(_on_done)
+        assert token.link_future(future) is future
+
+        errors = await _cancel_on_thread(token.cancel)
+
+        assert errors == []
+        await asyncio.wait_for(callback_called.wait(), timeout=2)
+        assert future.cancelled()
+    finally:
+        loop.set_debug(previous_debug)
+
+
+@pytest.mark.asyncio
+async def test_link_future_to_already_cancelled_token_from_other_thread() -> None:
+    """Linking a future from another thread must still cancel it when the token is already cancelled."""
+    loop = asyncio.get_running_loop()
+    previous_debug = loop.get_debug()
+    loop.set_debug(True)
+    try:
+        token = CancellationToken()
+        token.cancel()
+        future: asyncio.Future[None] = loop.create_future()
+        callback_called = asyncio.Event()
+
+        def _on_done(_future: asyncio.Future[None]) -> None:
+            callback_called.set()
+
+        future.add_done_callback(_on_done)
+
+        errors = await _cancel_on_thread(lambda: token.link_future(future))
+
+        assert errors == []
+        await asyncio.wait_for(callback_called.wait(), timeout=2)
+        assert future.cancelled()
+    finally:
+        loop.set_debug(previous_debug)
+
+
+@pytest.mark.asyncio
+async def test_cancel_linked_future_on_closed_loop_does_not_raise() -> None:
+    """Cancelling a future whose loop is already closed must not raise."""
+    loop = asyncio.new_event_loop()
+    try:
+        future: asyncio.Future[None] = loop.create_future()
+
+        def _on_done(_future: asyncio.Future[None]) -> None:
+            return None
+
+        future.add_done_callback(_on_done)
+        loop.close()
+
+        token = CancellationToken()
+        token.link_future(future)
+        token.cancel()
+        assert future.cancelled()
+    finally:
+        if not loop.is_closed():
+            loop.close()
